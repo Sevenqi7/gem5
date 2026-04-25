@@ -79,6 +79,8 @@ class SimpleExecContext : public ExecContext
     Counter lastIcacheStall;
     // Number of cycles stalled for D-cache responses
     Counter lastDcacheStall;
+    // Extra execution delay requested by the current instruction.
+    Cycles timingStall;
 
     struct ExecContextStats : public statistics::Group
     {
@@ -175,8 +177,22 @@ class SimpleExecContext : public ExecContext
     SimpleExecContext(BaseSimpleCPU* _cpu, SimpleThread* _thread)
         : cpu(_cpu), thread(_thread), fetchOffset(0), stayAtPC(false),
         numInst(0), numOp(0), numLoad(0), lastIcacheStall(0),
-        lastDcacheStall(0), execContextStats(cpu, thread)
+        lastDcacheStall(0), timingStall(0), execContextStats(cpu, thread)
     { }
+
+    void
+    addTimingStall(Cycles cycles) override
+    {
+        timingStall += cycles;
+    }
+
+    Cycles
+    getAndResetTimingStall() override
+    {
+        const Cycles stall = timingStall;
+        timingStall = Cycles(0);
+        return stall;
+    }
 
     RegVal
     getRegOperand(const StaticInst *si, int idx) override

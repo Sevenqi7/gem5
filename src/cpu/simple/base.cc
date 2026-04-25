@@ -333,6 +333,7 @@ BaseSimpleCPU::preExecute()
     // resets predicates
     t_info.setPredicate(true);
     t_info.setMemAccPredicate(true);
+    t_info.getAndResetTimingStall();
 
     // decode the instruction
     set(preExecuteTempPC, thread->pcState());

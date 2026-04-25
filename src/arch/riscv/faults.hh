@@ -84,6 +84,7 @@ enum ExceptionCode : uint64_t
     LOAD_PAGE = 13,
     STORE_PAGE = 15,
     AMO_PAGE = 15,
+    CLB_MISS = 24,
 
     INT_SOFTWARE_USER = 0,
     INT_SOFTWARE_SUPER = 1,
@@ -285,6 +286,19 @@ class AddressFault : public RiscvFault
   public:
     AddressFault(const Addr addr, ExceptionCode code)
         : RiscvFault("Address", FaultType::OTHERS, code), _addr(addr)
+    {}
+
+    RegVal trap_value() const override { return _addr; }
+};
+
+class CLBMissFault : public RiscvFault
+{
+  private:
+    const Addr _addr;
+
+  public:
+    CLBMissFault(const Addr addr)
+        : RiscvFault("CLB miss", FaultType::OTHERS, CLB_MISS), _addr(addr)
     {}
 
     RegVal trap_value() const override { return _addr; }

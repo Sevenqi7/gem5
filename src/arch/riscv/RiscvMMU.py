@@ -36,6 +36,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from m5.objects.BaseMMU import BaseMMU
+from m5.objects.CLB import CLB
 from m5.objects.PMAChecker import PMAChecker
 from m5.objects.PMP import PMP
 from m5.objects.RiscvTLB import RiscvTLB
@@ -51,6 +52,7 @@ class RiscvMMU(BaseMMU):
     dtb = RiscvTLB(entry_type="data")
     pma_checker = Param.BasePMAChecker(PMAChecker(), "PMA Checker")
     pmp = Param.PMP(PMP(), "Physical Memory Protection Unit")
+    clb = Param.CLB(CLB(), "Capability Lookaside Buffer")
 
     @classmethod
     def walkerPorts(cls):

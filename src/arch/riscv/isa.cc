@@ -175,6 +175,14 @@ namespace RiscvISA
     [MISCREG_PMPADDR13]     = "PMPADDR13",
     [MISCREG_PMPADDR14]     = "PMPADDR14",
     [MISCREG_PMPADDR15]     = "PMPADDR15",
+    [MISCREG_MCLB_CTRL]     = "MCLB_CTRL",
+    [MISCREG_MCTABLE_BASE]  = "MCTABLE_BASE",
+    [MISCREG_MCLB_SETUP_BASE] = "MCLB_SETUP_BASE",
+    [MISCREG_MCLB_SETUP_LIMIT] = "MCLB_SETUP_LIMIT",
+    [MISCREG_MCLB_SETUP_META] = "MCLB_SETUP_META",
+    [MISCREG_UCLB_CFR_BASE] = "UCLB_CFR_BASE",
+    [MISCREG_UCLB_CFR_LIMIT] = "UCLB_CFR_LIMIT",
+    [MISCREG_UCLB_CFR_META] = "UCLB_CFR_META",
 
     [MISCREG_SEDELEG]       = "SEDELEG",
     [MISCREG_SIDELEG]       = "SIDELEG",
@@ -720,6 +728,52 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
                 uint32_t pmp_index = idx-MISCREG_PMPADDR00;
                 if (mmu->getPMP()->pmpUpdateAddr(pmp_index, val)) {
                     setMiscRegNoEffect(idx, val);
+                }
+            }
+            break;
+          case MISCREG_MCLB_CTRL:
+            {
+                auto mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+                RegVal clb_ctl = val & MCLB_CTRL_MASK;
+                setMiscRegNoEffect(idx, clb_ctl);
+                if (mmu && mmu->getCLB()) {
+                    mmu->getCLB()->setEnable(bits(clb_ctl, 0));
+                }
+            }
+            break;
+          case MISCREG_MCTABLE_BASE:
+            {
+                auto mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+                setMiscRegNoEffect(idx, val);
+                if (mmu && mmu->getCLB()) {
+                    mmu->getCLB()->setCtableBase(val);
+                }
+            }
+            break;
+          case MISCREG_MCLB_SETUP_BASE:
+            {
+                auto mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+                setMiscRegNoEffect(idx, val);
+                if (mmu && mmu->getCLB()) {
+                    mmu->getCLB()->setSetupBase(val);
+                }
+            }
+            break;
+          case MISCREG_MCLB_SETUP_LIMIT:
+            {
+                auto mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+                setMiscRegNoEffect(idx, val);
+                if (mmu && mmu->getCLB()) {
+                    mmu->getCLB()->setSetupLimit(val);
+                }
+            }
+            break;
+          case MISCREG_MCLB_SETUP_META:
+            {
+                auto mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+                setMiscRegNoEffect(idx, val);
+                if (mmu && mmu->getCLB()) {
+                    mmu->getCLB()->setSetupMeta(val);
                 }
             }
             break;

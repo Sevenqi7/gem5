@@ -196,6 +196,18 @@ class ExecContext
     virtual ThreadContext *tcBase() const = 0;
 
     /**
+     * Request additional execution delay for the current instruction when the
+     * underlying CPU model supports it. Models without instruction timing can
+     * ignore this hint.
+     */
+    virtual void addTimingStall(Cycles cycles) {}
+
+    /**
+     * Consume any pending instruction-local execution delay.
+     */
+    virtual Cycles getAndResetTimingStall() { return Cycles(0); }
+
+    /**
      * @{
      * @name ARM-Specific Interfaces
      */

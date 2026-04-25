@@ -35,6 +35,7 @@
 #include <list>
 
 #include "arch/generic/tlb.hh"
+#include "arch/riscv/clb.hh"
 #include "arch/riscv/isa.hh"
 #include "arch/riscv/pagetable.hh"
 #include "arch/riscv/pma_checker.hh"
@@ -88,6 +89,7 @@ class TLB : public BaseTLB
   public:
     BasePMAChecker *pma;
     PMP *pmp;
+    CLB *clb;
 
   public:
     typedef RiscvTLBParams Params;

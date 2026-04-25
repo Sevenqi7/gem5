@@ -807,13 +807,18 @@ TimingSimpleCPU::advanceInst(const Fault &fault)
     serviceInstCountEvents();
 
     if (_status == BaseSimpleCPU::Running) {
+        const Cycles timing_stall = t_info.getAndResetTimingStall();
+        if (timing_stall > Cycles(0)) {
+            reschedule(fetchEvent, clockEdge(timing_stall), true);
+            return;
+        }
+
         // kick off fetch of next instruction... callback from icache
         // response will cause that instruction to be executed,
         // keeping the CPU running.
         fetch();
     }
 }
-
 
 void
 TimingSimpleCPU::completeIfetch(PacketPtr pkt)

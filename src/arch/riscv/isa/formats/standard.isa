@@ -388,7 +388,12 @@ def template CSRExecute {{
         %(code)s;
 
         if (%(write_cond)s) {
-            if (bits(csr, 11, 10) == 0x3) {
+            const bool privCfrWrite =
+                pm != PRV_U &&
+                (csr == CSR_UCLB_CFR_BASE ||
+                 csr == CSR_UCLB_CFR_LIMIT ||
+                 csr == CSR_UCLB_CFR_META);
+            if (bits(csr, 11, 10) == 0x3 && !privCfrWrite) {
                 return std::make_shared<IllegalInstFault>(
                         csprintf("CSR %s is read-only\n", csrName), machInst);
             }

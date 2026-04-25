@@ -79,7 +79,7 @@ buildKey(Addr vpn, uint16_t asid)
 TLB::TLB(const Params &p) :
     BaseTLB(p), size(p.size), tlb(size),
     lruSeq(0), stats(this), pma(p.pma_checker),
-    pmp(p.pmp)
+    pmp(p.pmp), clb(p.clb)
 {
     for (size_t x = 0; x < size; x++) {
         tlb[x].trieHandle = NULL;
@@ -394,10 +394,14 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
         }
 
         if (!delayed && fault == NoFault) {
-            // do pmp check if any checking condition is met.
-            // timingFault will be NoFault if pmp checks are
-            // passed, otherwise an address fault will be returned.
-            fault = pmp->pmpCheck(req, mode, pmode, tc);
+            if (clb && clb->enabled()) {
+                fault = clb->clbCheck(req, mode, pmode, tc);
+            } else {
+                // do pmp check if any checking condition is met.
+                // timingFault will be NoFault if pmp checks are
+                // passed, otherwise an address fault will be returned.
+                fault = pmp->pmpCheck(req, mode, pmode, tc);
+            }
         }
 
         if (!delayed && fault == NoFault) {

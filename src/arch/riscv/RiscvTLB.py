@@ -47,6 +47,7 @@ class RiscvPagetableWalker(ClockedObject):
     # Grab the pma_checker from the MMU
     pma_checker = Param.BasePMAChecker(Parent.any, "PMA Checker")
     pmp = Param.PMP(Parent.any, "PMP")
+    clb = Param.CLB(Parent.any, "Capability Lookaside Buffer")
 
 
 class RiscvTLB(BaseTLB):
@@ -61,3 +62,4 @@ class RiscvTLB(BaseTLB):
     # Grab the pma_checker from the MMU
     pma_checker = Param.BasePMAChecker(Parent.any, "PMA Checker")
     pmp = Param.PMP(Parent.any, "Physical Memory Protection Unit")
+    clb = Param.CLB(Parent.any, "Capability Lookaside Buffer")

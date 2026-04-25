@@ -39,12 +39,12 @@
 #define __ARCH_RISCV_MMU_HH__
 
 #include "arch/generic/mmu.hh"
+#include "arch/riscv/clb.hh"
 #include "arch/riscv/isa.hh"
 #include "arch/riscv/page_size.hh"
 #include "arch/riscv/pma_checker.hh"
 #include "arch/riscv/pmp.hh"
 #include "arch/riscv/tlb.hh"
-
 #include "params/RiscvMMU.hh"
 
 namespace gem5
@@ -66,6 +66,7 @@ class MMU : public BaseMMU
     {
         // Reset PMP Cfg
         getPMP()->pmpReset();
+        getCLB()->reset();
     }
 
     Addr
@@ -110,6 +111,12 @@ class MMU : public BaseMMU
     getPMP()
     {
         return static_cast<TLB*>(dtb)->pmp;
+    }
+
+    CLB *
+    getCLB()
+    {
+        return static_cast<TLB*>(dtb)->clb;
     }
 
     /*
