@@ -88,6 +88,8 @@ class CLB : public SimObject
     void setSetupLimit(Addr limit);
     void setSetupMeta(RegVal meta);
     bool fillLine(unsigned index, RegVal pid);
+    OpResponse readLine(unsigned index, ThreadContext *tc) const;
+    bool invalidateLine(unsigned index);
     Cycles fillTimingStall() const;
     Cycles flushTimingStall() const;
 

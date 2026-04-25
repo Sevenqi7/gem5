@@ -4930,7 +4930,59 @@ decode QUADRANT default Unknown::unknown() {
                                     IprAccessOp);
                             }
                         }
-                        0x2: uclb_revoke({{
+                        0x2: mclb_read({{
+                            auto pm = (PrivilegeMode)xc->readMiscReg(
+                                MISCREG_PRV);
+                            if (pm != PRV_M) {
+                                return std::make_shared<IllegalInstFault>(
+                                    "mclb.read outside M-mode", machInst);
+                            }
+
+                            auto mmu = dynamic_cast<RiscvISA::MMU *>(
+                                xc->tcBase()->getMMUPtr());
+                            panic_if(!mmu, "Invalid MMU for mclb.read.");
+                            auto *clb = mmu->getCLB();
+                            if (!clb) {
+                                return std::make_shared<IllegalInstFault>(
+                                    "mclb.read without CLB", machInst);
+                            }
+
+                            auto response = clb->readLine(rvZext(Rs1),
+                                                          xc->tcBase());
+                            Rd = response.value;
+                            xc->addTimingStall(response.stall);
+                        }}, IsSerializeAfter, IsNonSpeculative,
+                            IprAccessOp);
+                        0x3: decode RD {
+                            0x0: mclb_invalid({{
+                                auto pm = (PrivilegeMode)xc->readMiscReg(
+                                    MISCREG_PRV);
+                                if (pm != PRV_M) {
+                                    return std::make_shared<IllegalInstFault>(
+                                        "mclb.invalid outside M-mode",
+                                        machInst);
+                                }
+
+                                auto mmu = dynamic_cast<RiscvISA::MMU *>(
+                                    xc->tcBase()->getMMUPtr());
+                                panic_if(!mmu,
+                                         "Invalid MMU for mclb.invalid.");
+                                auto *clb = mmu->getCLB();
+                                if (!clb) {
+                                    return std::make_shared<IllegalInstFault>(
+                                        "mclb.invalid without CLB",
+                                        machInst);
+                                }
+
+                                if (!clb->invalidateLine(rvZext(Rs1))) {
+                                    return std::make_shared<IllegalInstFault>(
+                                        "mclb.invalid rejected line index",
+                                        machInst);
+                                }
+                            }}, IsSerializeAfter, IsNonSpeculative,
+                                IprAccessOp);
+                        }
+                        0x4: uclb_revoke({{
                             auto pm = (PrivilegeMode)xc->readMiscReg(
                                 MISCREG_PRV);
                             if (pm != PRV_U) {
@@ -4953,7 +5005,7 @@ decode QUADRANT default Unknown::unknown() {
                             xc->addTimingStall(response.stall);
                         }}, IsSerializeAfter, IsNonSpeculative,
                             IprAccessOp);
-                        0x3: uclb_get({{
+                        0x5: uclb_get({{
                             auto pm = (PrivilegeMode)xc->readMiscReg(
                                 MISCREG_PRV);
                             if (pm != PRV_U) {
@@ -4976,7 +5028,7 @@ decode QUADRANT default Unknown::unknown() {
                             xc->addTimingStall(response.stall);
                         }}, IsSerializeAfter, IsNonSpeculative,
                             IprAccessOp);
-                        0x4: uclb_delete({{
+                        0x6: uclb_delete({{
                             auto pm = (PrivilegeMode)xc->readMiscReg(
                                 MISCREG_PRV);
                             if (pm != PRV_U) {

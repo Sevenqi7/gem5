@@ -152,6 +152,54 @@ CLB::fillLine(unsigned index, RegVal pid)
     return true;
 }
 
+CLB::OpResponse
+CLB::readLine(unsigned index, ThreadContext *tc) const
+{
+    if (!tc) {
+        warn("mclb.read ignored without a thread context.\n");
+        return {.value = static_cast<RegVal>(-1)};
+    }
+
+    if (index >= entries.size()) {
+        DPRINTF(CLB,
+                "mclb.read rejected out-of-range line index %u (entries=%u)\n",
+                index, entries.size());
+        return {.value = static_cast<RegVal>(-1)};
+    }
+
+    const auto &entry = entries[index];
+    if (!entry.valid) {
+        DPRINTF(CLB, "mclb.read found CLB line %u invalid\n", index);
+        return {.value = static_cast<RegVal>(-1)};
+    }
+
+    commitCfr(tc, entry.range.start(), entry.range.end(),
+              packMeta(entry.capIndex, entry.capFree,
+                       entry.capSize, entry.perms));
+    DPRINTF(CLB,
+            "mclb.read committed CLB line %u to CFR: pid=%u, "
+            "range=[%#x, %#x), cap_index=%u, cap_free=%u, cap_size=%u, "
+            "perms=%u\n",
+            index, entry.pid, entry.range.start(), entry.range.end(),
+            entry.capIndex, entry.capFree, entry.capSize, entry.perms);
+    return {.value = 0};
+}
+
+bool
+CLB::invalidateLine(unsigned index)
+{
+    if (index >= entries.size()) {
+        warn("CLB invalidate ignored for invalid line index %u.\n", index);
+        return false;
+    }
+
+    const bool was_valid = entries[index].valid;
+    entries[index] = ClbEntry();
+    DPRINTF(CLB, "Invalidated CLB line %u (was_valid=%d)\n",
+            index, was_valid);
+    return true;
+}
+
 RegVal
 CLB::packMeta(uint32_t capIndex, uint16_t capFree,
               uint16_t capSize, uint8_t perms) const
