@@ -83,6 +83,9 @@ class ExecContext : public gem5::ExecContext
     /** Instruction for the benefit of memory operations and for PC */
     MinorDynInstPtr inst;
 
+    /** Extra execution delay requested by the current instruction. */
+    Cycles timingStall{0};
+
     ExecContext (
         MinorCPU &cpu_,
         SimpleThread &thread_, Execute &execute_,
@@ -141,6 +144,20 @@ class ExecContext : public gem5::ExecContext
         return execute.getLSQ().pushRequest(inst, false /* amo */, nullptr,
             size, addr, flags, nullptr, std::move(amo_op),
             std::vector<bool>(size, true));
+    }
+
+    void
+    addTimingStall(Cycles cycles) override
+    {
+        timingStall += cycles;
+    }
+
+    Cycles
+    getAndResetTimingStall() override
+    {
+        const Cycles stall = timingStall;
+        timingStall = Cycles(0);
+        return stall;
     }
 
     RegVal

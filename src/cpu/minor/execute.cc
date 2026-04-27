@@ -37,6 +37,7 @@
 
 #include "cpu/minor/execute.hh"
 
+#include <algorithm>
 #include <functional>
 
 #include "cpu/minor/cpu.hh"
@@ -971,6 +972,18 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
         fault = inst->staticInst->execute(&context,
             inst->traceData);
 
+        const Cycles timing_stall = context.getAndResetTimingStall();
+        if (timing_stall > Cycles(0)) {
+            executeInfo[thread_id].timingStallUntil = std::max(
+                executeInfo[thread_id].timingStallUntil,
+                cpu.curCycle() + timing_stall);
+            DPRINTF(MinorExecute,
+                "Applied timing stall of %d cycles to [tid:%d] after %s "
+                "(until cycle %d)\n",
+                timing_stall, thread_id, *inst,
+                executeInfo[thread_id].timingStallUntil);
+        }
+
         /* Set the predicate for tracing and dump */
         if (inst->traceData)
             inst->traceData->setPredicate(context.readPredicate());
@@ -1407,14 +1420,25 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
             if (num_mem_refs_committed == memoryCommitLimit)
                 DPRINTF(MinorExecute, "Reached mem ref commit limit\n");
         }
+
+        if (isTimingStalled(thread_id, now)) {
+            completed_inst = false;
+        }
     }
 }
 
 bool
 Execute::isInbetweenInsts(ThreadID thread_id) const
 {
-    return executeInfo[thread_id].lastCommitWasEndOfMacroop &&
+    return !isTimingStalled(thread_id, cpu.curCycle()) &&
+        executeInfo[thread_id].lastCommitWasEndOfMacroop &&
         !lsq.accessesInFlight();
+}
+
+bool
+Execute::isTimingStalled(ThreadID thread_id, Cycles now) const
+{
+    return executeInfo[thread_id].timingStallUntil > now;
 }
 
 void
@@ -1509,7 +1533,7 @@ Execute::evaluate()
     for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
         /* Find the next issuable instruction for each thread and see if it can
            be issued */
-        if (getInput(tid)) {
+        if (!isTimingStalled(tid, cpu.curCycle()) && getInput(tid)) {
             unsigned int input_index = executeInfo[tid].inputIndex;
             MinorDynInstPtr inst = getInput(tid)->insts[input_index];
             if (inst->isFault()) {
@@ -1521,6 +1545,7 @@ Execute::evaluate()
     }
 
     bool becoming_stalled = true;
+    bool timing_stall_active = false;
 
     /* Advance the pipelines and note whether they still need to be
      * advanced */
@@ -1551,11 +1576,17 @@ Execute::evaluate()
     bool head_inst_might_commit = false;
 
     /* Could the head in flight insts be committed */
-    for (auto const &info : executeInfo) {
+    for (ThreadID tid = 0; tid < cpu.numThreads; tid++) {
+        const auto &info = executeInfo[tid];
+        timing_stall_active = timing_stall_active ||
+            isTimingStalled(tid, cpu.curCycle());
+
         if (!info.inFlightInsts->empty()) {
             const QueuedInst &head_inst = info.inFlightInsts->front();
 
-            if (head_inst.inst->isNoCostInst()) {
+            if (isTimingStalled(tid, cpu.curCycle())) {
+                continue;
+            } else if (head_inst.inst->isNoCostInst()) {
                 head_inst_might_commit = true;
             } else {
                 FUPipeline *fu = funcUnits[head_inst.inst->fuIndex];
@@ -1576,6 +1607,7 @@ Execute::evaluate()
        (can_issue_next ? " (can issued next inst)" : ""),
        (head_inst_might_commit ? "(head inst might commit)" : ""),
        (lsq.needsToTick() ? " (LSQ needs to tick)" : ""),
+       (timing_stall_active ? " (timing stall active)" : ""),
        (interrupted ? " (interrupted)" : ""));
 
     bool need_to_tick =
@@ -1584,6 +1616,7 @@ Execute::evaluate()
        can_issue_next || /* Can still issue a new inst */
        head_inst_might_commit || /* Could possible commit the next inst */
        lsq.needsToTick() || /* Must step the dcache port */
+       timing_stall_active || /* Custom op timing stall in progress */
        interrupted; /* There are pending interrupts */
 
     if (!need_to_tick) {
@@ -1703,6 +1736,9 @@ Execute::getCommittingThread()
 
     for (auto tid : priority_list) {
         ExecuteThreadInfo &ex_info = executeInfo[tid];
+        if (isTimingStalled(tid, cpu.curCycle())) {
+            continue;
+        }
         bool can_commit_insts = !ex_info.inFlightInsts->empty();
         if (can_commit_insts) {
             QueuedInst *head_inflight_inst = &(ex_info.inFlightInsts->front());
@@ -1769,7 +1805,7 @@ Execute::getIssuingThread()
     }
 
     for (auto tid : priority_list) {
-        if (getInput(tid)) {
+        if (!isTimingStalled(tid, cpu.curCycle()) && getInput(tid)) {
             issuePriority = tid;
             return tid;
         }

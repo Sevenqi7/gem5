@@ -158,7 +158,8 @@ class Execute : public Named
             instsBeingCommitted(insts_committed),
             streamSeqNum(InstId::firstStreamSeqNum),
             lastPredictionSeqNum(InstId::firstPredictionSeqNum),
-            drainState(NotDraining)
+            drainState(NotDraining),
+            timingStallUntil(0)
         { }
 
         ExecuteThreadInfo(const ExecuteThreadInfo& other) :
@@ -167,7 +168,8 @@ class Execute : public Named
             instsBeingCommitted(other.instsBeingCommitted),
             streamSeqNum(other.streamSeqNum),
             lastPredictionSeqNum(other.lastPredictionSeqNum),
-            drainState(other.drainState)
+            drainState(other.drainState),
+            timingStallUntil(other.timingStallUntil)
         { }
 
         /** In-order instructions either in FUs or the LSQ */
@@ -202,6 +204,11 @@ class Execute : public Named
 
         /** State progression for draining NotDraining -> ... -> DrainAllInsts */
         DrainState drainState;
+
+        /** Thread-local post-commit timing stall, used for lightweight
+         *  modeling of custom instruction latency without issuing memory
+         *  requests through the LSQ. */
+        Cycles timingStallUntil;
     };
 
     std::vector<ExecuteThreadInfo> executeInfo;
@@ -258,6 +265,9 @@ class Execute : public Named
 
     /** Are we between instructions?  Can we be interrupted? */
     bool isInbetweenInsts(ThreadID thread_id) const;
+
+    /** Is the thread blocked by a post-commit timing stall? */
+    bool isTimingStalled(ThreadID thread_id, Cycles now) const;
 
     /** Act on an interrupt.  Returns true if an interrupt was actually
      *  signalled and invoked */
