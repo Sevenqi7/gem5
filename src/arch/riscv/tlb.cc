@@ -394,7 +394,9 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
         }
 
         if (!delayed && fault == NoFault) {
-            if (clb && clb->enabled()) {
+            if (CLB::isInternalAccess(req)) {
+                fault = NoFault;
+            } else if (clb && clb->enabled()) {
                 fault = clb->clbCheck(req, mode, pmode, tc);
             } else {
                 // do pmp check if any checking condition is met.

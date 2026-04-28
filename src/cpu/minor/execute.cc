@@ -65,15 +65,21 @@ namespace minor
 namespace
 {
 
-bool
+[[maybe_unused]] bool
 isPreparedClbPipelineOp(const MinorDynInstPtr &inst)
+{
+    return inst && inst->clbPipelinePrepared;
+}
+
+bool
+needsClbPipelinePrep(const MinorDynInstPtr &inst)
 {
     if (!inst || inst->isFault() || !inst->isInst()) {
         return false;
     }
 
     const auto &name = inst->staticInst->getName();
-    return name == "uclb_get" || name == "uclb_delete";
+    return name == "uclb_get" || name == "uclb_delete_probe";
 }
 
 bool
@@ -86,8 +92,8 @@ isSerializingClbStateOp(const MinorDynInstPtr &inst)
     const auto &name = inst->staticInst->getName();
     return name == "mclb_fill" || name == "mclb_read" ||
            name == "mclb_flush" || name == "mclb_invalid" ||
-           name == "uclb_get" || name == "uclb_delete" ||
-           name == "uclb_revoke";
+           name == "uclb_get" || name == "uclb_revoke" ||
+           name.rfind("uclb_delete", 0) == 0;
 }
 
 } // anonymous namespace
@@ -915,32 +921,57 @@ bool
 Execute::prepareClbPipelineOp(MinorDynInstPtr inst, ThreadID thread_id,
                               Cycles &extra_dest_retire_lat)
 {
-    if (!isPreparedClbPipelineOp(inst)) {
+    [[maybe_unused]] auto unused_extra_dest_retire_lat =
+        extra_dest_retire_lat;
+
+    if (!needsClbPipelinePrep(inst)) {
         return true;
     }
 
-    auto &thread = executeInfo[thread_id];
-    if (!thread.inFlightInsts->empty()) {
+    if (inst->clbPipelinePrepared) {
+        if (inst->clbPipelinePending &&
+            cpu.curCycle() < inst->clbPipelineReadyCycle) {
+            DPRINTF(MinorExecute,
+                    "Pre-issue CLB lookup for %s still pending until %d "
+                    "(now %d)\n",
+                    *inst, inst->clbPipelineReadyCycle, cpu.curCycle());
+            return false;
+        }
+
+        inst->clbPipelinePending = false;
+        return true;
+    }
+
+    ThreadContext *thread = cpu.getContext(thread_id);
+    auto *mmu = dynamic_cast<RiscvISA::MMU *>(thread->getMMUPtr());
+    if (!mmu || !mmu->getCLB()) {
+        return true;
+    }
+
+    const auto &reg = inst->staticInst->srcRegIdx(0);
+    const unsigned index = static_cast<unsigned>(thread->getReg(reg));
+    const auto &inst_name = inst->staticInst->getName();
+    const auto result = (inst_name == "uclb_get") ?
+        mmu->getCLB()->lookupMinorGet(index, thread) :
+        mmu->getCLB()->lookupMinorDelete(index, thread);
+
+    inst->clbPipelinePrepared = true;
+    inst->clbPipelineLocalHit = result.localHit;
+    inst->clbPipelineReadyCycle = cpu.curCycle() + result.latency;
+
+    DPRINTF(MinorExecute,
+            "Prepared CLB pipeline op %s for cap_index=%u local_hit=%d "
+            "ready_cycle=%d\n",
+            *inst, index, inst->clbPipelineLocalHit,
+            inst->clbPipelineReadyCycle);
+
+    if (result.latency != Cycles(0) &&
+        cpu.curCycle() < inst->clbPipelineReadyCycle) {
+        inst->clbPipelinePending = true;
         return false;
     }
 
-    ThreadContext *tc = cpu.getContext(thread_id);
-    auto *mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
-    auto *clb = mmu ? mmu->getCLB() : nullptr;
-    if (!clb) {
-        return true;
-    }
-
-    const unsigned index = tc->getReg(inst->staticInst->srcRegIdx(0));
-    RiscvISA::CLB::OpResponse response;
-
-    if (inst->staticInst->getName() == "uclb_get") {
-        response = clb->prepareMinorGet(index, tc, inst->id.execSeqNum);
-    } else {
-        response = clb->prepareMinorDelete(index, tc, inst->id.execSeqNum);
-    }
-
-    extra_dest_retire_lat += response.stall;
+    inst->clbPipelinePending = false;
     return true;
 }
 

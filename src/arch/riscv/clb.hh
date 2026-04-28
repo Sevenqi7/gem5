@@ -37,6 +37,7 @@
 #include "base/addr_range.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
+#include "mem/request.hh"
 #include "params/CLB.hh"
 #include "sim/sim_object.hh"
 
@@ -67,7 +68,13 @@ namespace RiscvISA
  */
 class CLB : public SimObject
 {
+  private:
+    struct CtableMemCap;
+
   public:
+    static constexpr Request::FlagsType InternalCtableAccess =
+        Request::FlagsType(0x8);
+
     /** Result returned by CLB access-control lookups. */
     struct AccessCheckResult
     {
@@ -80,6 +87,13 @@ class CLB : public SimObject
     {
         RegVal value = 0;
         Cycles stall = Cycles(0);
+    };
+
+    /** Result returned by MinorCPU issue-time CLB path selection. */
+    struct MinorLookupResult
+    {
+        bool localHit = false;
+        Cycles latency = Cycles(0);
     };
 
     PARAMS(CLB);
@@ -115,6 +129,9 @@ class CLB : public SimObject
     OpResponse revokeCap(unsigned index, ThreadContext *tc);
     OpResponse deleteCap(unsigned index, ThreadContext *tc,
                          InstSeqNum seq_num = 0);
+    MinorLookupResult lookupMinorGet(unsigned index, ThreadContext *tc) const;
+    MinorLookupResult lookupMinorDelete(unsigned index,
+                                        ThreadContext *tc) const;
     OpResponse prepareMinorGet(unsigned index, ThreadContext *tc,
                                InstSeqNum seq_num);
     OpResponse prepareMinorDelete(unsigned index, ThreadContext *tc,
@@ -122,6 +139,28 @@ class CLB : public SimObject
     void discardPreparedMinorOp(ThreadID tid, InstSeqNum seq_num);
     void clearCfr(ThreadContext *tc) const;
     void flushAll();
+    bool prepareTimingGet(unsigned index, ThreadContext *tc, Addr &addr);
+    RegVal completeTimingGetLocal(ThreadContext *tc);
+    RegVal completeTimingGetMiss(Addr capAddr, const uint8_t *raw,
+                                 ThreadContext *tc);
+    RegVal executeDeleteProbeFunctional(unsigned index, ThreadContext *tc);
+    RegVal executeDeleteCommitFunctional(ThreadContext *tc);
+    bool prepareTimingDeleteProbe(unsigned index, ThreadContext *tc,
+                                  Addr &addr);
+    RegVal completeTimingDeleteProbeLocal(ThreadContext *tc) const;
+    RegVal completeTimingDeleteProbeMiss(Addr capAddr, const uint8_t *raw,
+                                         ThreadContext *tc);
+    bool pendingDeleteWriteback(ThreadContext *tc, Addr &addr, uint8_t *raw,
+                                unsigned size) const;
+    RegVal completeTimingDeleteCommit(ThreadContext *tc, bool writeCtable);
+    static constexpr unsigned CtableCapBytes = 16;
+    unsigned ctableCapBytes() const { return CtableCapBytes; }
+    Addr localProxyAddr(ThreadContext *tc, unsigned index = 0) const;
+    Addr ctableCapAddr(unsigned index) const;
+    unsigned ctableCapIndex(Addr capAddr) const;
+
+    static bool isInternalAccess(const RequestPtr &req);
+    static bool isInternalAccess(const Request::Flags &flags);
 
   private:
     /** Layout of one capability-table entry as observed by the CLB model. */
@@ -135,6 +174,8 @@ class CLB : public SimObject
         uint32_t base = 0;
         uint32_t size = 0;
     };
+
+    static_assert(sizeof(CtableMemCap) == CtableCapBytes);
 
     /** Cache line stored in the CLB array. */
     struct ClbEntry
@@ -186,10 +227,28 @@ class CLB : public SimObject
         Addr cfrBase = 0;
         Addr cfrLimit = 0;
         RegVal cfrMeta = 0;
-        bool clearCtable = false;
+        bool writeCtable = false;
         Addr ctableAddr = 0;
+        CtableMemCap ctableCap = {};
         bool invalidateCap = false;
         unsigned invalidateIndex = 0;
+    };
+
+    struct PendingGetState
+    {
+        Addr base = 0;
+        Addr limit = 0;
+        RegVal meta = 0;
+    };
+
+    struct PendingDeleteState
+    {
+        Addr ctableAddr = 0;
+        Addr base = 0;
+        Addr limit = 0;
+        RegVal meta = 0;
+        unsigned invalidateIndex = 0;
+        CtableMemCap ctableCap = {};
     };
 
     // Functional capability-table access helpers.
@@ -204,6 +263,7 @@ class CLB : public SimObject
     OpResponse startRevokeFunctional(unsigned index, ThreadContext *tc);
     PreparedMinorOp buildGetOp(unsigned index, ThreadContext *tc) const;
     PreparedMinorOp buildDeleteOp(unsigned index, ThreadContext *tc) const;
+    MinorLookupResult minorLookup(unsigned index, ThreadContext *tc) const;
     void commitPreparedOp(const PreparedMinorOp &op, ThreadContext *tc);
     OpResponse consumePreparedMinorOp(unsigned index, ThreadContext *tc,
                                       InstSeqNum seq_num,
@@ -212,12 +272,28 @@ class CLB : public SimObject
     // CLB line ownership / metadata helpers.
     bool currentPidMatches(const ClbEntry &entry, ThreadContext *tc) const;
     bool findOwnedCapInClb(unsigned index, ThreadContext *tc) const;
+    const ClbEntry *findOwnedCapLine(unsigned index,
+                                     ThreadContext *tc) const;
     uint8_t currentPid(ThreadContext *tc) const;
     RegVal packMeta(uint32_t capIndex, uint16_t capFree,
                     uint16_t capSize, uint8_t perms) const;
     Cycles timingSimpleStall(Cycles latency) const;
     void commitCfr(ThreadContext *tc, Addr base, Addr limit,
                    RegVal meta) const;
+    CtableMemCap decodeCtableCap(const uint8_t *raw) const;
+    ThreadID threadId(ThreadContext *tc) const;
+    void stagePendingGet(ThreadContext *tc, Addr base, Addr limit,
+                         RegVal meta);
+    bool takePendingGet(ThreadContext *tc, PendingGetState &state);
+    void clearPendingGet(ThreadContext *tc);
+    void stagePendingDelete(ThreadContext *tc, Addr ctableAddr,
+                            Addr base, Addr limit, RegVal meta,
+                            unsigned invalidateIndex,
+                            const CtableMemCap &ctableCap);
+    bool peekPendingDelete(ThreadContext *tc,
+                           PendingDeleteState &state) const;
+    bool takePendingDelete(ThreadContext *tc, PendingDeleteState &state);
+    void clearPendingDelete(ThreadContext *tc);
     unsigned updateCachedCapMeta(unsigned index, uint8_t pid,
                                  uint16_t capFree);
     unsigned invalidateCapEntries(unsigned index, uint8_t pid);
@@ -226,7 +302,7 @@ class CLB : public SimObject
     // Persistent CLB state.
     bool _enabled;
     const bool _resetEnable;
-    const Cycles _accessLatency;
+    const Cycles _lookupLatency;
     const Cycles _getHitLatency;
     const Cycles _getCtableLatency;
     const Cycles _deleteHitLatency;
@@ -240,6 +316,8 @@ class CLB : public SimObject
     RegVal _setupMeta;
     std::vector<ClbEntry> entries;
     std::map<PreparedMinorKey, PreparedMinorOp> preparedMinorOps;
+    std::map<ThreadID, PendingGetState> pendingGets;
+    std::map<ThreadID, PendingDeleteState> pendingDeletes;
 
     // Fault construction and permission checking.
     Fault createAccessFault(Addr vaddr, BaseMMU::Mode mode) const;

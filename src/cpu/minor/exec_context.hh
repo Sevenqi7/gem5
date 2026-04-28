@@ -89,6 +89,10 @@ class ExecContext : public gem5::ExecContext
             return NoFault;
         }
 
+        if (RiscvISA::CLB::isInternalAccess(flags)) {
+            return NoFault;
+        }
+
         if (inst->clbGatePending) {
             if (cpu.curCycle() < inst->clbGateReadyCycle) {
                 DPRINTF(MinorMem,

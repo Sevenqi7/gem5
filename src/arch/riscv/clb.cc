@@ -39,6 +39,7 @@
 #include "cpu/thread_context.hh"
 #include "debug/CLB.hh"
 #include "params/CLB.hh"
+#include "sim/byteswap.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -47,11 +48,23 @@ namespace gem5
 namespace RiscvISA
 {
 
+namespace
+{
+
+Cycles
+selectLookupLatency(const CLBParams &params)
+{
+    return params.clb_lookup_latency != Cycles(1) ?
+        params.clb_lookup_latency : params.access_latency;
+}
+
+} // anonymous namespace
+
 // Construction and reset ----------------------------------------------------
 
 CLB::CLB(const Params &params)
     : SimObject(params), _enabled(params.enable), _resetEnable(params.enable),
-      _accessLatency(params.access_latency),
+      _lookupLatency(selectLookupLatency(params)),
       _getHitLatency(params.get_hit_latency),
       _getCtableLatency(params.get_ctable_latency),
       _deleteHitLatency(params.delete_hit_latency),
@@ -73,6 +86,8 @@ CLB::reset()
     _setupLimit = 0;
     _setupMeta = 0;
     preparedMinorOps.clear();
+    pendingGets.clear();
+    pendingDeletes.clear();
 
     for (auto &entry : entries) {
         entry = ClbEntry();
@@ -249,6 +264,150 @@ CLB::clearCfr(ThreadContext *tc) const
     DPRINTF(CLB, "Cleared CFR state\n");
 }
 
+CLB::CtableMemCap
+CLB::decodeCtableCap(const uint8_t *raw) const
+{
+    CtableMemCap cap = {};
+    uint16_t owner = 0;
+    uint16_t cfree = 0;
+    uint16_t csize = 0;
+    uint32_t base = 0;
+    uint32_t size = 0;
+
+    std::memcpy(&owner, raw, sizeof(owner));
+    std::memcpy(&cfree, raw + 2, sizeof(cfree));
+    std::memcpy(&csize, raw + 4, sizeof(csize));
+    std::memcpy(&cap.slot, raw + 6, sizeof(cap.slot));
+    std::memcpy(&cap.rwx, raw + 7, sizeof(cap.rwx));
+    std::memcpy(&base, raw + 8, sizeof(base));
+    std::memcpy(&size, raw + 12, sizeof(size));
+
+    cap.owner = letoh(owner);
+    cap.cfree = letoh(cfree);
+    cap.csize = letoh(csize);
+    cap.base = letoh(base);
+    cap.size = letoh(size);
+    return cap;
+}
+
+ThreadID
+CLB::threadId(ThreadContext *tc) const
+{
+    panic_if(!tc, "CLB thread-local state requires a thread context.");
+    return static_cast<ThreadID>(tc->threadId());
+}
+
+void
+CLB::stagePendingGet(ThreadContext *tc, Addr base, Addr limit, RegVal meta)
+{
+    pendingGets[threadId(tc)] = PendingGetState{base, limit, meta};
+}
+
+bool
+CLB::takePendingGet(ThreadContext *tc, PendingGetState &state)
+{
+    auto it = pendingGets.find(threadId(tc));
+    if (it == pendingGets.end()) {
+        return false;
+    }
+
+    state = it->second;
+    pendingGets.erase(it);
+    return true;
+}
+
+void
+CLB::clearPendingGet(ThreadContext *tc)
+{
+    if (tc) {
+        pendingGets.erase(threadId(tc));
+    }
+}
+
+void
+CLB::stagePendingDelete(ThreadContext *tc, Addr ctableAddr,
+                        Addr base, Addr limit, RegVal meta,
+                        unsigned invalidateIndex,
+                        const CtableMemCap &ctableCap)
+{
+    pendingDeletes[threadId(tc)] = PendingDeleteState{
+        ctableAddr, base, limit, meta, invalidateIndex, ctableCap};
+}
+
+bool
+CLB::peekPendingDelete(ThreadContext *tc, PendingDeleteState &state) const
+{
+    auto it = pendingDeletes.find(threadId(tc));
+    if (it == pendingDeletes.end()) {
+        return false;
+    }
+
+    state = it->second;
+    return true;
+}
+
+bool
+CLB::takePendingDelete(ThreadContext *tc, PendingDeleteState &state)
+{
+    auto it = pendingDeletes.find(threadId(tc));
+    if (it == pendingDeletes.end()) {
+        return false;
+    }
+
+    state = it->second;
+    pendingDeletes.erase(it);
+    return true;
+}
+
+void
+CLB::clearPendingDelete(ThreadContext *tc)
+{
+    if (tc) {
+        pendingDeletes.erase(threadId(tc));
+    }
+}
+
+Addr
+CLB::ctableCapAddr(unsigned index) const
+{
+    panic_if(_ctableBase == 0,
+             "CLB ctable address requested before mctable_base setup.");
+    return _ctableBase + (index * sizeof(CtableMemCap));
+}
+
+unsigned
+CLB::ctableCapIndex(Addr capAddr) const
+{
+    panic_if(_ctableBase == 0,
+             "CLB ctable index requested before mctable_base setup.");
+    panic_if(capAddr < _ctableBase,
+             "CLB ctable address %#x is below base %#x.",
+             capAddr, _ctableBase);
+    return (capAddr - _ctableBase) / sizeof(CtableMemCap);
+}
+
+Addr
+CLB::localProxyAddr(ThreadContext *tc, unsigned index) const
+{
+    if (_ctableBase != 0 && index < MaxCapEntries) {
+        return _ctableBase + (index * sizeof(CtableMemCap));
+    }
+
+    return tc ? tc->pcState().instAddr() : 0;
+}
+
+bool
+CLB::isInternalAccess(const RequestPtr &req)
+{
+    return req && (req->getArchFlags() & InternalCtableAccess);
+}
+
+bool
+CLB::isInternalAccess(const Request::Flags &flags)
+{
+    return flags.isSet(InternalCtableAccess);
+}
+
 bool
 CLB::readCtableCapFunctional(unsigned index, ThreadContext *tc,
                              Addr &capAddr, CtableMemCap &cap) const
@@ -375,6 +534,92 @@ CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
     auto *self = const_cast<CLB *>(this);
     self->commitPreparedOp(op, tc);
     return {.value = op.value, .stall = op.stall};
+}
+
+CLB::MinorLookupResult
+CLB::minorLookup(unsigned index, ThreadContext *tc) const
+{
+    MinorLookupResult result = {};
+
+    if (!tc || index >= MaxCapEntries) {
+        return result;
+    }
+
+    result.latency = _lookupLatency;
+    result.localHit = findOwnedCapLine(index, tc) != nullptr;
+    return result;
+}
+
+CLB::MinorLookupResult
+CLB::lookupMinorGet(unsigned index, ThreadContext *tc) const
+{
+    return minorLookup(index, tc);
+}
+
+CLB::MinorLookupResult
+CLB::lookupMinorDelete(unsigned index, ThreadContext *tc) const
+{
+    return minorLookup(index, tc);
+}
+
+bool
+CLB::prepareTimingGet(unsigned index, ThreadContext *tc, Addr &addr)
+{
+    addr = localProxyAddr(tc, index);
+    clearPendingGet(tc);
+
+    if (!tc || index >= MaxCapEntries) {
+        return true;
+    }
+
+    if (const auto *entry = findOwnedCapLine(index, tc)) {
+        stagePendingGet(tc, entry->range.start(), entry->range.end(),
+                        packMeta(entry->capIndex, entry->capFree,
+                                 entry->capSize, entry->perms));
+        return true;
+    }
+
+    if (_ctableBase == 0) {
+        return true;
+    }
+
+    addr = ctableCapAddr(index);
+    return false;
+}
+
+RegVal
+CLB::completeTimingGetLocal(ThreadContext *tc)
+{
+    PendingGetState state;
+    if (!takePendingGet(tc, state)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    commitCfr(tc, state.base, state.limit, state.meta);
+    return 0;
+}
+
+RegVal
+CLB::completeTimingGetMiss(Addr capAddr, const uint8_t *raw,
+                           ThreadContext *tc)
+{
+    if (!tc || _ctableBase == 0) {
+        return static_cast<RegVal>(-1);
+    }
+
+    const unsigned index = ctableCapIndex(capAddr);
+    if (index >= MaxCapEntries) {
+        return static_cast<RegVal>(-1);
+    }
+
+    const CtableMemCap cap = decodeCtableCap(raw);
+    if (bits(cap.owner, 7, 0) != currentPid(tc)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    commitCfr(tc, cap.base, cap.base + cap.size,
+              packMeta(index, cap.cfree, cap.csize, cap.rwx));
+    return 0;
 }
 
 // CLB metadata maintenance helpers ------------------------------------------
@@ -566,15 +811,24 @@ CLB::buildDeleteOp(unsigned index, ThreadContext *tc) const
         DPRINTF(CLB,
                 "uclb.delete hit in CLB for cap_index=%u pid=%u, committed "
                 "deleted capability to CFR, invalidated cached entries, "
-                "and cleared ctable entry %#x\n",
+                "and invalidated the ctable owner at %#x\n",
                 index, pid, capAddr);
+        CtableMemCap cap = {};
+        cap.owner = 0;
+        cap.cfree = entry.capFree;
+        cap.csize = entry.capSize;
+        cap.slot = 0;
+        cap.rwx = entry.perms;
+        cap.base = entry.range.start();
+        cap.size = entry.range.end() - entry.range.start();
         op.writeCfr = true;
         op.cfrBase = entry.range.start();
         op.cfrLimit = entry.range.end();
         op.cfrMeta = packMeta(entry.capIndex, entry.capFree,
                               entry.capSize, entry.perms);
-        op.clearCtable = true;
+        op.writeCtable = true;
         op.ctableAddr = capAddr;
+        op.ctableCap = cap;
         op.invalidateCap = true;
         op.invalidateIndex = index;
         op.value = 0;
@@ -604,12 +858,15 @@ CLB::buildDeleteOp(unsigned index, ThreadContext *tc) const
             "deleted capability to CFR from ctable, and invalidated cached "
             "entries at ctable entry %#x\n",
             index, pid, capAddr);
+    cap.owner = 0;
+    cap.slot = 0;
     op.writeCfr = true;
     op.cfrBase = cap.base;
     op.cfrLimit = cap.base + cap.size;
     op.cfrMeta = packMeta(index, cap.cfree, cap.csize, cap.rwx);
-    op.clearCtable = true;
+    op.writeCtable = true;
     op.ctableAddr = capAddr;
+    op.ctableCap = cap;
     op.invalidateCap = true;
     op.invalidateIndex = index;
     op.value = 0;
@@ -625,6 +882,155 @@ CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
     return {.value = op.value, .stall = op.stall};
 }
 
+RegVal
+CLB::executeDeleteProbeFunctional(unsigned index, ThreadContext *tc)
+{
+    clearPendingDelete(tc);
+
+    if (!tc || index >= MaxCapEntries || _ctableBase == 0) {
+        return static_cast<RegVal>(-1);
+    }
+
+    if (const auto *entry = findOwnedCapLine(index, tc)) {
+        CtableMemCap cap = {};
+        cap.owner = 0;
+        cap.cfree = entry->capFree;
+        cap.csize = entry->capSize;
+        cap.slot = 0;
+        cap.rwx = entry->perms;
+        cap.base = entry->range.start();
+        cap.size = entry->range.end() - entry->range.start();
+        stagePendingDelete(tc, ctableCapAddr(index), entry->range.start(),
+                           entry->range.end(),
+                           packMeta(entry->capIndex, entry->capFree,
+                                    entry->capSize, entry->perms),
+                           index, cap);
+        return 0;
+    }
+
+    CtableMemCap cap = {};
+    Addr capAddr = 0;
+    if (!readCtableCapFunctional(index, tc, capAddr, cap)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    if (bits(cap.owner, 7, 0) != currentPid(tc)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    cap.owner = 0;
+    cap.slot = 0;
+    stagePendingDelete(tc, capAddr, cap.base, cap.base + cap.size,
+                       packMeta(index, cap.cfree, cap.csize, cap.rwx),
+                       index, cap);
+    return 0;
+}
+
+RegVal
+CLB::executeDeleteCommitFunctional(ThreadContext *tc)
+{
+    return completeTimingDeleteCommit(tc, true);
+}
+
+bool
+CLB::prepareTimingDeleteProbe(unsigned index, ThreadContext *tc, Addr &addr)
+{
+    addr = localProxyAddr(tc, index);
+    clearPendingDelete(tc);
+
+    if (!tc || index >= MaxCapEntries || _ctableBase == 0) {
+        return true;
+    }
+
+    if (const auto *entry = findOwnedCapLine(index, tc)) {
+        CtableMemCap cap = {};
+        cap.owner = 0;
+        cap.cfree = entry->capFree;
+        cap.csize = entry->capSize;
+        cap.slot = 0;
+        cap.rwx = entry->perms;
+        cap.base = entry->range.start();
+        cap.size = entry->range.end() - entry->range.start();
+        stagePendingDelete(tc, ctableCapAddr(index), entry->range.start(),
+                           entry->range.end(),
+                           packMeta(entry->capIndex, entry->capFree,
+                                    entry->capSize, entry->perms),
+                           index, cap);
+        return true;
+    }
+
+    addr = ctableCapAddr(index);
+    return false;
+}
+
+RegVal
+CLB::completeTimingDeleteProbeLocal(ThreadContext *tc) const
+{
+    PendingDeleteState state;
+    return peekPendingDelete(tc, state) ? 0 : static_cast<RegVal>(-1);
+}
+
+RegVal
+CLB::completeTimingDeleteProbeMiss(Addr capAddr, const uint8_t *raw,
+                                   ThreadContext *tc)
+{
+    if (!tc || _ctableBase == 0) {
+        return static_cast<RegVal>(-1);
+    }
+
+    const unsigned index = ctableCapIndex(capAddr);
+    if (index >= MaxCapEntries) {
+        return static_cast<RegVal>(-1);
+    }
+
+    const CtableMemCap cap = decodeCtableCap(raw);
+    if (bits(cap.owner, 7, 0) != currentPid(tc)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    CtableMemCap deleted = cap;
+    deleted.owner = 0;
+    deleted.slot = 0;
+    stagePendingDelete(tc, capAddr, cap.base, cap.base + cap.size,
+                       packMeta(index, cap.cfree, cap.csize, cap.rwx),
+                       index, deleted);
+    return 0;
+}
+
+bool
+CLB::pendingDeleteWriteback(ThreadContext *tc, Addr &addr, uint8_t *raw,
+                            unsigned size) const
+{
+    PendingDeleteState state;
+    if (!peekPendingDelete(tc, state)) {
+        return false;
+    }
+
+    panic_if(size < sizeof(state.ctableCap),
+             "Pending delete writeback buffer too small: %u < %zu",
+             size, sizeof(state.ctableCap));
+    addr = state.ctableAddr;
+    std::memcpy(raw, &state.ctableCap, sizeof(state.ctableCap));
+    return true;
+}
+
+RegVal
+CLB::completeTimingDeleteCommit(ThreadContext *tc, bool writeCtable)
+{
+    PendingDeleteState state;
+    if (!takePendingDelete(tc, state)) {
+        return static_cast<RegVal>(-1);
+    }
+
+    if (writeCtable) {
+        writeCtableCapFunctional(state.ctableAddr, tc, state.ctableCap);
+    }
+
+    commitCfr(tc, state.base, state.limit, state.meta);
+    invalidateCapEntries(state.invalidateIndex);
+    return 0;
+}
+
 void
 CLB::commitPreparedOp(const PreparedMinorOp &op, ThreadContext *tc)
 {
@@ -636,9 +1042,8 @@ CLB::commitPreparedOp(const PreparedMinorOp &op, ThreadContext *tc)
         commitCfr(tc, op.cfrBase, op.cfrLimit, op.cfrMeta);
     }
 
-    if (op.clearCtable) {
-        CtableMemCap cleared = {};
-        writeCtableCapFunctional(op.ctableAddr, tc, cleared);
+    if (op.writeCtable) {
+        writeCtableCapFunctional(op.ctableAddr, tc, op.ctableCap);
     }
 
     if (op.invalidateCap) {
@@ -751,6 +1156,8 @@ void
 CLB::flushAll()
 {
     preparedMinorOps.clear();
+    pendingGets.clear();
+    pendingDeletes.clear();
 
     for (auto &entry : entries) {
         entry = ClbEntry();
@@ -817,23 +1224,33 @@ CLB::currentPidMatches(const ClbEntry &entry, ThreadContext *tc) const
 bool
 CLB::findOwnedCapInClb(unsigned index, ThreadContext *tc) const
 {
+    return findOwnedCapLine(index, tc) != nullptr;
+}
+
+const CLB::ClbEntry *
+CLB::findOwnedCapLine(unsigned index, ThreadContext *tc) const
+{
     for (const auto &entry : entries) {
         if (!entry.valid || entry.capIndex != index) {
             continue;
         }
 
         if (currentPidMatches(entry, tc)) {
-            return true;
+            return &entry;
         }
     }
 
-    return false;
+    return nullptr;
 }
 
 Fault
 CLB::clbCheck(const RequestPtr &req, BaseMMU::Mode mode,
               PrivilegeMode pmode, ThreadContext *tc, Addr vaddr) const
 {
+    if (isInternalAccess(req)) {
+        return NoFault;
+    }
+
     const Addr faultAddr = req->hasVaddr() ? req->getVaddr() : vaddr;
     return lookupAccess(req->getPaddr(), req->getSize(), mode, pmode, tc,
                         faultAddr).fault;
@@ -849,7 +1266,7 @@ CLB::lookupAccess(Addr paddr, unsigned size, BaseMMU::Mode mode,
         return result;
     }
 
-    result.latency = _accessLatency;
+    result.latency = _lookupLatency;
 
     const Addr faultAddr = vaddr ? vaddr : paddr;
     const Addr end = paddr + size - 1;

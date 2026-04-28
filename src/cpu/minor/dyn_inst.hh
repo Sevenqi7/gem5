@@ -207,6 +207,12 @@ class MinorDynInst : public RefCounted
     Cycles clbGateReadyCycle{0};
     Fault clbGateFault = NoFault;
 
+    /** MinorCPU-only pre-issue CLB lookup state for user CLB mem ops. */
+    bool clbPipelinePrepared = false;
+    bool clbPipelinePending = false;
+    bool clbPipelineLocalHit = false;
+    Cycles clbPipelineReadyCycle{0};
+
     /** The instruction has been sent to the store buffer */
     bool inStoreBuffer = false;
 

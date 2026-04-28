@@ -13,14 +13,19 @@ class CLB(SimObject):
     enable = Param.Bool(False, "Enable capability lookaside buffer checks")
     clb_entries = Param.Int(8, "Number of CLB entries")
 
-    # Instruction-level timing model. MinorCPU additionally uses
-    # access_latency as a pre-LSQ delay for ordinary data accesses.
+    # Instruction-level timing model.
+    # MinorCPU uses clb_lookup_latency for both ordinary access-control
+    # lookups and the pre-issue CLB probe on uclb.get/uclb.delete.
     # Local fixed-latency CLB maintenance operations such as fill/flush/read
     # rely on the core pipeline's own execution latency instead of an extra
     # CLB-side stall.
+    clb_lookup_latency = Param.Cycles(
+        1,
+        "Latency of a local CLB lookup before either a normal data access or a MinorCPU user CLB memory op",
+    )
     access_latency = Param.Cycles(
         1,
-        "Total latency of a CLB access-control lookup for an ordinary data access",
+        "Deprecated alias for clb_lookup_latency retained for older configurations",
     )
     get_hit_latency = Param.Cycles(2, "Total latency of uclb.get on a CLB hit")
     get_ctable_latency = Param.Cycles(

@@ -4999,54 +4999,8 @@ decode QUADRANT default Unknown::unknown() {
                             xc->addTimingStall(response.stall);
                         }}, IsSerializeAfter, IsNonSpeculative,
                             IprAccessOp);
-                        0x5: uclb_get({{
-                            auto pm = (PrivilegeMode)xc->readMiscReg(
-                                MISCREG_PRV);
-                            if (pm != PRV_U) {
-                                return std::make_shared<IllegalInstFault>(
-                                    "uclb.get outside U-mode", machInst);
-                            }
-
-                            auto mmu = dynamic_cast<RiscvISA::MMU *>(
-                                xc->tcBase()->getMMUPtr());
-                            panic_if(!mmu, "Invalid MMU for uclb.get.");
-                            auto *clb = mmu->getCLB();
-                            if (!clb) {
-                                return std::make_shared<IllegalInstFault>(
-                                    "uclb.get without CLB", machInst);
-                            }
-
-                            auto response = clb->getCfr(
-                                rvZext(Rs1), xc->tcBase(),
-                                xc->currentInstSeqNum());
-                            Rd = response.value;
-                            xc->addTimingStall(response.stall);
-                        }}, IsSerializeAfter, IsNonSpeculative,
-                            IprAccessOp);
-                        0x6: uclb_delete({{
-                            auto pm = (PrivilegeMode)xc->readMiscReg(
-                                MISCREG_PRV);
-                            if (pm != PRV_U) {
-                                return std::make_shared<IllegalInstFault>(
-                                    "uclb.delete outside U-mode", machInst);
-                            }
-
-                            auto mmu = dynamic_cast<RiscvISA::MMU *>(
-                                xc->tcBase()->getMMUPtr());
-                            panic_if(!mmu, "Invalid MMU for uclb.delete.");
-                            auto *clb = mmu->getCLB();
-                            if (!clb) {
-                                return std::make_shared<IllegalInstFault>(
-                                    "uclb.delete without CLB", machInst);
-                            }
-
-                            auto response = clb->deleteCap(
-                                rvZext(Rs1), xc->tcBase(),
-                                xc->currentInstSeqNum());
-                            Rd = response.value;
-                            xc->addTimingStall(response.stall);
-                        }}, IsSerializeAfter, IsNonSpeculative,
-                            IprAccessOp);
+                        0x5: ClbGetOp::ClbGetOp();
+                        0x6: ClbDeleteOp::ClbDeleteOp();
                     }
                 }
             }
