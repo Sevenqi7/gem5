@@ -276,6 +276,13 @@ class Execute : public Named
     /** Try and issue instructions from the inputBuffer */
     unsigned int issue(ThreadID thread_id);
 
+    /** Return true when an in-flight CLB op must block younger issue. */
+    bool blocksOnInFlightClbOp(ThreadID thread_id) const;
+
+    /** Prepare variable-latency CLB ops before their FU issue point. */
+    bool prepareClbPipelineOp(MinorDynInstPtr inst, ThreadID thread_id,
+                              Cycles &extra_dest_retire_lat);
+
     /** Try to act on PC-related events.  Returns true if any were
      *  executed */
     bool tryPCEvents(ThreadID thread_id);

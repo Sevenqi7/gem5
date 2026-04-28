@@ -202,6 +202,11 @@ class MinorDynInst : public RefCounted
     /** Translation fault in case of a mem ref */
     Fault translationFault;
 
+    /** MinorCPU-only pre-LSQ CLB access gate state for mem refs. */
+    bool clbGatePending = false;
+    Cycles clbGateReadyCycle{0};
+    Fault clbGateFault = NoFault;
+
     /** The instruction has been sent to the store buffer */
     bool inStoreBuffer = false;
 

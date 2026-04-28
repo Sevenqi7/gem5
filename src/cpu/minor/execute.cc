@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <functional>
 
+#include "arch/riscv/mmu.hh"
 #include "cpu/minor/cpu.hh"
 #include "cpu/minor/exec_context.hh"
 #include "cpu/minor/fetch1.hh"
@@ -60,6 +61,36 @@ namespace gem5
 
 namespace minor
 {
+
+namespace
+{
+
+bool
+isPreparedClbPipelineOp(const MinorDynInstPtr &inst)
+{
+    if (!inst || inst->isFault() || !inst->isInst()) {
+        return false;
+    }
+
+    const auto &name = inst->staticInst->getName();
+    return name == "uclb_get" || name == "uclb_delete";
+}
+
+bool
+isSerializingClbStateOp(const MinorDynInstPtr &inst)
+{
+    if (!inst || inst->isFault() || !inst->isInst()) {
+        return false;
+    }
+
+    const auto &name = inst->staticInst->getName();
+    return name == "mclb_fill" || name == "mclb_read" ||
+           name == "mclb_flush" || name == "mclb_invalid" ||
+           name == "uclb_get" || name == "uclb_delete" ||
+           name == "uclb_revoke";
+}
+
+} // anonymous namespace
 
 Execute::Execute(const std::string &name_,
     MinorCPU &cpu_,
@@ -471,7 +502,9 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
         Fault init_fault = inst->staticInst->initiateAcc(&context,
             inst->traceData);
 
-        if (inst->inLSQ) {
+        if (inst->clbGatePending) {
+            DPRINTF(MinorMem, "Mem ref inst:%s waiting on CLB gate\n", *inst);
+        } else if (inst->inLSQ) {
             if (init_fault != NoFault) {
                 assert(inst->translationFault != NoFault);
                 // Translation faults are dealt with in handleMemResponse()
@@ -483,7 +516,9 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
             }
         }
 
-        if (init_fault != NoFault) {
+        if (inst->clbGatePending) {
+            issued = false;
+        } else if (init_fault != NoFault) {
             DPRINTF(MinorExecute, "Fault on memory inst: %s"
                 " initiateAcc: %s\n", *inst, init_fault->name());
             fault = init_fault;
@@ -514,7 +549,14 @@ Execute::executeMemRefInst(MinorDynInstPtr inst, BranchData &branch,
 
         /* Restore thread PC */
         thread->pcState(*old_pc);
-        issued = true;
+
+        /*
+         * A mem ref waiting on the MinorCPU CLB gate has not reached the LSQ
+         * yet and must be retried on a later cycle.
+         */
+        if (!inst->clbGatePending) {
+            issued = true;
+        }
     }
 
     return issued;
@@ -593,6 +635,25 @@ Execute::issue(ThreadID thread_id)
             issued = true;
             discarded = true;
         } else {
+            if (blocksOnInFlightClbOp(thread_id)) {
+                DPRINTF(MinorExecute,
+                        "Delaying issue for tid:%d until in-flight CLB op "
+                        "commits\n",
+                        thread_id);
+                issued = false;
+                break;
+            }
+
+            if (isSerializingClbStateOp(inst) &&
+                !thread.inFlightInsts->empty()) {
+                DPRINTF(MinorExecute,
+                        "Delaying serializing CLB op %s until older "
+                        "instructions retire\n",
+                        *inst);
+                issued = false;
+                break;
+            }
+
             /* Try and issue an instruction into an FU, assume we didn't and
              * fix that in the loop */
             issued = false;
@@ -697,6 +758,14 @@ Execute::issue(ThreadID thread_id)
                                 timing->extraCommitLatExpr;
                             extra_assumed_lat =
                                 timing->extraAssumedLat;
+                        }
+
+                        if (!prepareClbPipelineOp(inst, thread_id,
+                                                  extra_dest_retire_lat)) {
+                            DPRINTF(MinorExecute,
+                                    "Delaying CLB pipeline op issue for %s\n",
+                                    *inst);
+                            break;
                         }
 
                         issued_mem_ref = inst->isMemRef();
@@ -829,6 +898,50 @@ Execute::issue(ThreadID thread_id)
         num_mem_insts_issued != memoryIssueLimit);
 
     return num_insts_issued;
+}
+
+bool
+Execute::blocksOnInFlightClbOp(ThreadID thread_id) const
+{
+    const auto &thread = executeInfo[thread_id];
+    if (thread.inFlightInsts->empty()) {
+        return false;
+    }
+
+    return isSerializingClbStateOp(thread.inFlightInsts->front().inst);
+}
+
+bool
+Execute::prepareClbPipelineOp(MinorDynInstPtr inst, ThreadID thread_id,
+                              Cycles &extra_dest_retire_lat)
+{
+    if (!isPreparedClbPipelineOp(inst)) {
+        return true;
+    }
+
+    auto &thread = executeInfo[thread_id];
+    if (!thread.inFlightInsts->empty()) {
+        return false;
+    }
+
+    ThreadContext *tc = cpu.getContext(thread_id);
+    auto *mmu = dynamic_cast<RiscvISA::MMU *>(tc->getMMUPtr());
+    auto *clb = mmu ? mmu->getCLB() : nullptr;
+    if (!clb) {
+        return true;
+    }
+
+    const unsigned index = tc->getReg(inst->staticInst->srcRegIdx(0));
+    RiscvISA::CLB::OpResponse response;
+
+    if (inst->staticInst->getName() == "uclb_get") {
+        response = clb->prepareMinorGet(index, tc, inst->id.execSeqNum);
+    } else {
+        response = clb->prepareMinorDelete(index, tc, inst->id.execSeqNum);
+    }
+
+    extra_dest_retire_lat += response.stall;
+    return true;
 }
 
 bool
@@ -1380,6 +1493,14 @@ Execute::commit(ThreadID thread_id, bool only_commit_microops, bool discard,
             /* Finished with the inst, remove it from the inst queue and
              *  clear its dependencies */
             ex_info.inFlightInsts->pop();
+
+            if (auto *mmu = dynamic_cast<RiscvISA::MMU *>(
+                    cpu.getContext(thread_id)->getMMUPtr())) {
+                if (auto *clb = mmu->getCLB()) {
+                    clb->discardPreparedMinorOp(thread_id,
+                                                inst->id.execSeqNum);
+                }
+            }
 
             /* Complete barriers in the LSQ/move to store buffer */
             if (inst->isInst() && inst->staticInst->isFullMemBarrier()) {

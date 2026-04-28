@@ -13,11 +13,15 @@ class CLB(SimObject):
     enable = Param.Bool(False, "Enable capability lookaside buffer checks")
     clb_entries = Param.Int(8, "Number of CLB entries")
 
-    # Instruction-level timing model. These parameters currently feed the
-    # TimingSimpleCPU stall hook and therefore model CLB latency as a local
-    # instruction delay rather than a bus-integrated microarchitecture.
-    fill_latency = Param.Cycles(2, "Total latency of mclb.fill")
-    flush_latency = Param.Cycles(1, "Total latency of mclb.flush")
+    # Instruction-level timing model. MinorCPU additionally uses
+    # access_latency as a pre-LSQ delay for ordinary data accesses.
+    # Local fixed-latency CLB maintenance operations such as fill/flush/read
+    # rely on the core pipeline's own execution latency instead of an extra
+    # CLB-side stall.
+    access_latency = Param.Cycles(
+        1,
+        "Total latency of a CLB access-control lookup for an ordinary data access",
+    )
     get_hit_latency = Param.Cycles(2, "Total latency of uclb.get on a CLB hit")
     get_ctable_latency = Param.Cycles(
         6, "Total latency of uclb.get when it reads the capability table"

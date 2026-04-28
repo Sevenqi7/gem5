@@ -51,7 +51,7 @@ namespace RiscvISA
 
 CLB::CLB(const Params &params)
     : SimObject(params), _enabled(params.enable), _resetEnable(params.enable),
-      _fillLatency(params.fill_latency), _flushLatency(params.flush_latency),
+      _accessLatency(params.access_latency),
       _getHitLatency(params.get_hit_latency),
       _getCtableLatency(params.get_ctable_latency),
       _deleteHitLatency(params.delete_hit_latency),
@@ -72,6 +72,7 @@ CLB::reset()
     _setupBase = 0;
     _setupLimit = 0;
     _setupMeta = 0;
+    preparedMinorOps.clear();
 
     for (auto &entry : entries) {
         entry = ClbEntry();
@@ -152,25 +153,25 @@ CLB::fillLine(unsigned index, RegVal pid)
     return true;
 }
 
-CLB::OpResponse
+RegVal
 CLB::readLine(unsigned index, ThreadContext *tc) const
 {
     if (!tc) {
         warn("mclb.read ignored without a thread context.\n");
-        return {.value = static_cast<RegVal>(-1)};
+        return static_cast<RegVal>(-1);
     }
 
     if (index >= entries.size()) {
         DPRINTF(CLB,
                 "mclb.read rejected out-of-range line index %u (entries=%u)\n",
                 index, entries.size());
-        return {.value = static_cast<RegVal>(-1)};
+        return static_cast<RegVal>(-1);
     }
 
     const auto &entry = entries[index];
     if (!entry.valid) {
         DPRINTF(CLB, "mclb.read found CLB line %u invalid\n", index);
-        return {.value = static_cast<RegVal>(-1)};
+        return static_cast<RegVal>(-1);
     }
 
     commitCfr(tc, entry.range.start(), entry.range.end(),
@@ -182,7 +183,7 @@ CLB::readLine(unsigned index, ThreadContext *tc) const
             "perms=%u\n",
             index, entry.pid, entry.range.start(), entry.range.end(),
             entry.capIndex, entry.capFree, entry.capSize, entry.perms);
-    return {.value = 0};
+    return 0;
 }
 
 bool
@@ -216,18 +217,6 @@ Cycles
 CLB::timingSimpleStall(Cycles latency) const
 {
     return latency > Cycles(0) ? latency - Cycles(1) : Cycles(0);
-}
-
-Cycles
-CLB::fillTimingStall() const
-{
-    return timingSimpleStall(_fillLatency);
-}
-
-Cycles
-CLB::flushTimingStall() const
-{
-    return timingSimpleStall(_flushLatency);
 }
 
 // CFR and capability-table helpers ------------------------------------------
@@ -290,12 +279,17 @@ CLB::writeCtableCapFunctional(Addr capAddr, ThreadContext *tc,
 
 // User-visible CLB custom instructions --------------------------------------
 
-CLB::OpResponse
-CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
+CLB::PreparedMinorOp
+CLB::buildGetOp(unsigned index, ThreadContext *tc) const
 {
+    PreparedMinorOp op = {};
+    op.kind = PreparedMinorOp::Kind::Get;
+    op.index = index;
+
     if (!tc) {
         warn("uclb.get ignored without a thread context.\n");
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     if (index >= MaxCapEntries) {
@@ -303,7 +297,8 @@ CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
                 "uclb.get rejected out-of-range cap_index=%u "
                 "(max entries=%u)\n",
                 index, MaxCapEntries);
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     const uint8_t pid = currentPid(tc);
@@ -324,13 +319,17 @@ CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
             continue;
         }
 
-        commitCfr(tc, entry.range.start(), entry.range.end(),
-                  packMeta(entry.capIndex, entry.capFree,
-                           entry.capSize, entry.perms));
+        op.writeCfr = true;
+        op.cfrBase = entry.range.start();
+        op.cfrLimit = entry.range.end();
+        op.cfrMeta = packMeta(entry.capIndex, entry.capFree,
+                              entry.capSize, entry.perms);
         DPRINTF(CLB,
                 "uclb.get satisfied from CLB line for cap_index=%u pid=%u\n",
                 index, pid);
-        return {.value = 0, .stall = timingSimpleStall(_getHitLatency)};
+        op.value = 0;
+        op.stall = timingSimpleStall(_getHitLatency);
+        return op;
     }
 
     DPRINTF(CLB, "uclb.get %s for cap_index=%u pid=%u\n",
@@ -341,7 +340,8 @@ CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
     CtableMemCap cap = {};
     Addr capAddr = 0;
     if (!readCtableCapFunctional(index, tc, capAddr, cap)) {
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     if (bits(cap.owner, 7, 0) != pid) {
@@ -349,18 +349,32 @@ CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
                 "uclb.get owner mismatch for cap_index=%u from ctable: "
                 "owner=%u current=%u\n",
                 index, cap.owner, pid);
-        return {.value = static_cast<RegVal>(-1),
-                .stall = timingSimpleStall(_getCtableLatency)};
+        op.value = static_cast<RegVal>(-1);
+        op.stall = timingSimpleStall(_getCtableLatency);
+        return op;
     }
 
     const Addr base = cap.base;
     const Addr limit = base + cap.size;
-    commitCfr(tc, base, limit,
-              packMeta(index, cap.cfree, cap.csize, cap.rwx));
+    op.writeCfr = true;
+    op.cfrBase = base;
+    op.cfrLimit = limit;
+    op.cfrMeta = packMeta(index, cap.cfree, cap.csize, cap.rwx);
     DPRINTF(CLB,
             "uclb.get loaded cap_index=%u from ctable entry %#x for pid=%u\n",
             index, capAddr, pid);
-    return {.value = 0, .stall = timingSimpleStall(_getCtableLatency)};
+    op.value = 0;
+    op.stall = timingSimpleStall(_getCtableLatency);
+    return op;
+}
+
+CLB::OpResponse
+CLB::startGetFunctional(unsigned index, ThreadContext *tc) const
+{
+    const auto op = buildGetOp(index, tc);
+    auto *self = const_cast<CLB *>(this);
+    self->commitPreparedOp(op, tc);
+    return {.value = op.value, .stall = op.stall};
 }
 
 // CLB metadata maintenance helpers ------------------------------------------
@@ -516,12 +530,17 @@ CLB::startRevokeFunctional(unsigned index, ThreadContext *tc)
 
 // uclb.delete ---------------------------------------------------------------
 
-CLB::OpResponse
-CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
+CLB::PreparedMinorOp
+CLB::buildDeleteOp(unsigned index, ThreadContext *tc) const
 {
+    PreparedMinorOp op = {};
+    op.kind = PreparedMinorOp::Kind::Delete;
+    op.index = index;
+
     if (!tc) {
         warn("uclb.delete ignored without a thread context.\n");
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     if (index >= MaxCapEntries) {
@@ -529,7 +548,8 @@ CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
                 "uclb.delete rejected out-of-range cap_index=%u "
                 "(max entries=%u)\n",
                 index, MaxCapEntries);
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     const uint8_t pid = currentPid(tc);
@@ -542,27 +562,31 @@ CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
             continue;
         }
 
-        commitCfr(tc, entry.range.start(), entry.range.end(),
-                  packMeta(entry.capIndex, entry.capFree,
-                           entry.capSize, entry.perms));
-
-        CtableMemCap cleared = {};
         const Addr capAddr = _ctableBase + (index * sizeof(CtableMemCap));
-        writeCtableCapFunctional(capAddr, tc, cleared);
-
-        const unsigned invalidated = invalidateCapEntries(index);
         DPRINTF(CLB,
                 "uclb.delete hit in CLB for cap_index=%u pid=%u, committed "
-                "deleted capability to CFR, invalidated %u CLB entries, "
+                "deleted capability to CFR, invalidated cached entries, "
                 "and cleared ctable entry %#x\n",
-                index, pid, invalidated, capAddr);
-        return {.value = 0, .stall = timingSimpleStall(_deleteHitLatency)};
+                index, pid, capAddr);
+        op.writeCfr = true;
+        op.cfrBase = entry.range.start();
+        op.cfrLimit = entry.range.end();
+        op.cfrMeta = packMeta(entry.capIndex, entry.capFree,
+                              entry.capSize, entry.perms);
+        op.clearCtable = true;
+        op.ctableAddr = capAddr;
+        op.invalidateCap = true;
+        op.invalidateIndex = index;
+        op.value = 0;
+        op.stall = timingSimpleStall(_deleteHitLatency);
+        return op;
     }
 
     CtableMemCap cap = {};
     Addr capAddr = 0;
     if (!readCtableCapFunctional(index, tc, capAddr, cap)) {
-        return {.value = static_cast<RegVal>(-1)};
+        op.value = static_cast<RegVal>(-1);
+        return op;
     }
 
     if (bits(cap.owner, 7, 0) != pid) {
@@ -570,30 +594,137 @@ CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
                 "uclb.delete owner mismatch for cap_index=%u from ctable: "
                 "owner=%u current=%u\n",
                 index, cap.owner, pid);
-        return {.value = static_cast<RegVal>(-1),
-                .stall = timingSimpleStall(_deleteMissLatency)};
+        op.value = static_cast<RegVal>(-1);
+        op.stall = timingSimpleStall(_deleteMissLatency);
+        return op;
     }
 
-    commitCfr(tc, cap.base, cap.base + cap.size,
-              packMeta(index, cap.cfree, cap.csize, cap.rwx));
-
-    cap = {};
-    writeCtableCapFunctional(capAddr, tc, cap);
-
-    const unsigned invalidated = invalidateCapEntries(index);
     DPRINTF(CLB,
             "uclb.delete missed in CLB for cap_index=%u pid=%u, committed "
-            "deleted capability to CFR from ctable, and invalidated %u "
-            "CLB entries at ctable entry %#x\n",
-            index, pid, invalidated, capAddr);
-    return {.value = 0, .stall = timingSimpleStall(_deleteMissLatency)};
+            "deleted capability to CFR from ctable, and invalidated cached "
+            "entries at ctable entry %#x\n",
+            index, pid, capAddr);
+    op.writeCfr = true;
+    op.cfrBase = cap.base;
+    op.cfrLimit = cap.base + cap.size;
+    op.cfrMeta = packMeta(index, cap.cfree, cap.csize, cap.rwx);
+    op.clearCtable = true;
+    op.ctableAddr = capAddr;
+    op.invalidateCap = true;
+    op.invalidateIndex = index;
+    op.value = 0;
+    op.stall = timingSimpleStall(_deleteMissLatency);
+    return op;
+}
+
+CLB::OpResponse
+CLB::startDeleteFunctional(unsigned index, ThreadContext *tc)
+{
+    const auto op = buildDeleteOp(index, tc);
+    commitPreparedOp(op, tc);
+    return {.value = op.value, .stall = op.stall};
+}
+
+void
+CLB::commitPreparedOp(const PreparedMinorOp &op, ThreadContext *tc)
+{
+    if (!tc) {
+        return;
+    }
+
+    if (op.writeCfr) {
+        commitCfr(tc, op.cfrBase, op.cfrLimit, op.cfrMeta);
+    }
+
+    if (op.clearCtable) {
+        CtableMemCap cleared = {};
+        writeCtableCapFunctional(op.ctableAddr, tc, cleared);
+    }
+
+    if (op.invalidateCap) {
+        invalidateCapEntries(op.invalidateIndex);
+    }
+}
+
+CLB::OpResponse
+CLB::prepareMinorGet(unsigned index, ThreadContext *tc, InstSeqNum seq_num)
+{
+    panic_if(seq_num == 0, "prepareMinorGet requires a dynamic sequence.");
+    panic_if(!tc, "prepareMinorGet requires a thread context.");
+
+    PreparedMinorKey key{static_cast<ThreadID>(tc->threadId()), seq_num};
+    panic_if(preparedMinorOps.find(key) != preparedMinorOps.end(),
+             "Duplicate prepared CLB op for tid=%u seq=%llu",
+             key.tid, key.seqNum);
+
+    const auto op = buildGetOp(index, tc);
+    preparedMinorOps.emplace(key, op);
+    return {.value = op.value, .stall = op.stall};
+}
+
+CLB::OpResponse
+CLB::prepareMinorDelete(unsigned index, ThreadContext *tc, InstSeqNum seq_num)
+{
+    panic_if(seq_num == 0, "prepareMinorDelete requires a dynamic sequence.");
+    panic_if(!tc, "prepareMinorDelete requires a thread context.");
+
+    PreparedMinorKey key{static_cast<ThreadID>(tc->threadId()), seq_num};
+    panic_if(preparedMinorOps.find(key) != preparedMinorOps.end(),
+             "Duplicate prepared CLB op for tid=%u seq=%llu",
+             key.tid, key.seqNum);
+
+    const auto op = buildDeleteOp(index, tc);
+    preparedMinorOps.emplace(key, op);
+    return {.value = op.value, .stall = op.stall};
+}
+
+void
+CLB::discardPreparedMinorOp(ThreadID tid, InstSeqNum seq_num)
+{
+    if (seq_num == 0) {
+        return;
+    }
+
+    preparedMinorOps.erase(PreparedMinorKey{tid, seq_num});
+}
+
+CLB::OpResponse
+CLB::consumePreparedMinorOp(unsigned index, ThreadContext *tc,
+                            InstSeqNum seq_num, PreparedMinorOp::Kind kind)
+{
+    if (!tc || seq_num == 0) {
+        return {.value = static_cast<RegVal>(-1), .stall = Cycles(0)};
+    }
+
+    PreparedMinorKey key{static_cast<ThreadID>(tc->threadId()), seq_num};
+    auto it = preparedMinorOps.find(key);
+    panic_if(it == preparedMinorOps.end(),
+             "Missing prepared CLB op for tid=%u seq=%llu",
+             key.tid, key.seqNum);
+
+    const PreparedMinorOp op = it->second;
+    preparedMinorOps.erase(it);
+
+    panic_if(op.kind != kind || op.index != index,
+             "Prepared CLB op mismatch for tid=%u seq=%llu",
+             key.tid, key.seqNum);
+
+    commitPreparedOp(op, tc);
+    return {.value = op.value, .stall = Cycles(0)};
 }
 
 // Public wrappers ------------------------------------------------------------
 
 CLB::OpResponse
-CLB::getCfr(unsigned index, ThreadContext *tc)
+CLB::getCfr(unsigned index, ThreadContext *tc, InstSeqNum seq_num)
 {
+    if (seq_num != 0) {
+        PreparedMinorKey key{static_cast<ThreadID>(tc->threadId()), seq_num};
+        if (preparedMinorOps.find(key) != preparedMinorOps.end()) {
+            return consumePreparedMinorOp(index, tc, seq_num,
+                                          PreparedMinorOp::Kind::Get);
+        }
+    }
     return startGetFunctional(index, tc);
 }
 
@@ -604,14 +735,23 @@ CLB::revokeCap(unsigned index, ThreadContext *tc)
 }
 
 CLB::OpResponse
-CLB::deleteCap(unsigned index, ThreadContext *tc)
+CLB::deleteCap(unsigned index, ThreadContext *tc, InstSeqNum seq_num)
 {
+    if (seq_num != 0) {
+        PreparedMinorKey key{static_cast<ThreadID>(tc->threadId()), seq_num};
+        if (preparedMinorOps.find(key) != preparedMinorOps.end()) {
+            return consumePreparedMinorOp(index, tc, seq_num,
+                                          PreparedMinorOp::Kind::Delete);
+        }
+    }
     return startDeleteFunctional(index, tc);
 }
 
 void
 CLB::flushAll()
 {
+    preparedMinorOps.clear();
+
     for (auto &entry : entries) {
         entry = ClbEntry();
     }
@@ -694,14 +834,25 @@ Fault
 CLB::clbCheck(const RequestPtr &req, BaseMMU::Mode mode,
               PrivilegeMode pmode, ThreadContext *tc, Addr vaddr) const
 {
+    const Addr faultAddr = req->hasVaddr() ? req->getVaddr() : vaddr;
+    return lookupAccess(req->getPaddr(), req->getSize(), mode, pmode, tc,
+                        faultAddr).fault;
+}
+
+CLB::AccessCheckResult
+CLB::lookupAccess(Addr paddr, unsigned size, BaseMMU::Mode mode,
+                  PrivilegeMode pmode, ThreadContext *tc, Addr vaddr) const
+{
+    AccessCheckResult result = {};
+
     if (!_enabled || pmode == PrivilegeMode::PRV_M) {
-        return NoFault;
+        return result;
     }
 
-    const Addr faultAddr = req->hasVaddr() ? req->getVaddr() : vaddr;
-    const Addr paddr = req->getPaddr();
-    const Addr end = paddr + req->getSize() - 1;
+    result.latency = _accessLatency;
 
+    const Addr faultAddr = vaddr ? vaddr : paddr;
+    const Addr end = paddr + size - 1;
     for (const auto &entry : entries) {
         if (!entry.valid) {
             continue;
@@ -716,14 +867,16 @@ CLB::clbCheck(const RequestPtr &req, BaseMMU::Mode mode,
         }
 
         if (permsAllow(entry.perms, mode)) {
-            return NoFault;
+            return result;
         }
 
-        return createAccessFault(faultAddr, mode);
+        result.fault = createAccessFault(faultAddr, mode);
+        return result;
     }
 
     warn_once("CLB miss fault raised for virtual address %#x.\n", faultAddr);
-    return createMissFault(faultAddr);
+    result.fault = createMissFault(faultAddr);
+    return result;
 }
 
 } // namespace RiscvISA

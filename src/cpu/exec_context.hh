@@ -44,6 +44,7 @@
 
 #include "base/types.hh"
 #include "cpu/base.hh"
+#include "cpu/inst_seq.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "cpu/translation.hh"
@@ -206,6 +207,12 @@ class ExecContext
      * Consume any pending instruction-local execution delay.
      */
     virtual Cycles getAndResetTimingStall() { return Cycles(0); }
+
+    /**
+     * Return the sequence number of the dynamic instruction currently being
+     * executed, when the CPU model tracks one.
+     */
+    virtual InstSeqNum currentInstSeqNum() const { return 0; }
 
     /**
      * @{

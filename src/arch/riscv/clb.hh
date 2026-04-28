@@ -29,12 +29,14 @@
 #ifndef __ARCH_RISCV_CLB_HH__
 #define __ARCH_RISCV_CLB_HH__
 
+#include <map>
 #include <vector>
 
 #include "arch/generic/mmu.hh"
 #include "arch/riscv/isa.hh"
 #include "base/addr_range.hh"
 #include "base/types.hh"
+#include "cpu/inst_seq.hh"
 #include "params/CLB.hh"
 #include "sim/sim_object.hh"
 
@@ -52,16 +54,27 @@ namespace RiscvISA
  * This SimObject plays three roles at once:
  * 1. Cache-like capability lookup for ordinary memory access control.
  * 2. Backend implementation of the CLB custom instructions and CSRs.
- * 3. Home of the current instruction-level timing model for those custom ops.
+ * 3. Home of the current instruction-level timing model for those custom ops
+ *    that need CLB/backend-dependent latency beyond the core pipeline's
+ *    built-in execution latency.
  *
  * The current model is intentionally lightweight:
  * - CLB line state is modeled explicitly.
  * - Capability-table reads/writes still use functional physProxy accesses.
- * - Extra latency is returned to the CPU as an instruction-local stall.
+ * - Variable-latency custom ops can return an instruction-local stall.
+ * - MinorCPU can also consume CLB lookup latency before a data access enters
+ *   its LSQ.
  */
 class CLB : public SimObject
 {
   public:
+    /** Result returned by CLB access-control lookups. */
+    struct AccessCheckResult
+    {
+        Fault fault = NoFault;
+        Cycles latency = Cycles(0);
+    };
+
     /** Result returned by user-visible CLB operations. */
     struct OpResponse
     {
@@ -76,6 +89,11 @@ class CLB : public SimObject
     Fault clbCheck(const RequestPtr &req, BaseMMU::Mode mode,
                    PrivilegeMode pmode, ThreadContext *tc,
                    Addr vaddr = 0) const;
+    AccessCheckResult lookupAccess(Addr paddr, unsigned size,
+                                   BaseMMU::Mode mode,
+                                   PrivilegeMode pmode,
+                                   ThreadContext *tc,
+                                   Addr vaddr = 0) const;
 
     /** Reset all CLB-visible state to its power-on values. */
     void reset();
@@ -88,15 +106,20 @@ class CLB : public SimObject
     void setSetupLimit(Addr limit);
     void setSetupMeta(RegVal meta);
     bool fillLine(unsigned index, RegVal pid);
-    OpResponse readLine(unsigned index, ThreadContext *tc) const;
+    RegVal readLine(unsigned index, ThreadContext *tc) const;
     bool invalidateLine(unsigned index);
-    Cycles fillTimingStall() const;
-    Cycles flushTimingStall() const;
 
     // User-visible custom instruction backend.
-    OpResponse getCfr(unsigned index, ThreadContext *tc);
+    OpResponse getCfr(unsigned index, ThreadContext *tc,
+                      InstSeqNum seq_num = 0);
     OpResponse revokeCap(unsigned index, ThreadContext *tc);
-    OpResponse deleteCap(unsigned index, ThreadContext *tc);
+    OpResponse deleteCap(unsigned index, ThreadContext *tc,
+                         InstSeqNum seq_num = 0);
+    OpResponse prepareMinorGet(unsigned index, ThreadContext *tc,
+                               InstSeqNum seq_num);
+    OpResponse prepareMinorDelete(unsigned index, ThreadContext *tc,
+                                  InstSeqNum seq_num);
+    void discardPreparedMinorOp(ThreadID tid, InstSeqNum seq_num);
     void clearCfr(ThreadContext *tc) const;
     void flushAll();
 
@@ -134,6 +157,41 @@ class CLB : public SimObject
 
     static constexpr unsigned MaxCapEntries = 2048;
 
+    struct PreparedMinorKey
+    {
+        ThreadID tid = 0;
+        InstSeqNum seqNum = 0;
+
+        bool
+        operator<(const PreparedMinorKey &other) const
+        {
+            return tid < other.tid ||
+                   (tid == other.tid && seqNum < other.seqNum);
+        }
+    };
+
+    struct PreparedMinorOp
+    {
+        enum class Kind
+        {
+            Get,
+            Delete,
+        };
+
+        Kind kind = Kind::Get;
+        unsigned index = 0;
+        RegVal value = 0;
+        Cycles stall = Cycles(0);
+        bool writeCfr = false;
+        Addr cfrBase = 0;
+        Addr cfrLimit = 0;
+        RegVal cfrMeta = 0;
+        bool clearCtable = false;
+        Addr ctableAddr = 0;
+        bool invalidateCap = false;
+        unsigned invalidateIndex = 0;
+    };
+
     // Functional capability-table access helpers.
     bool readCtableCapFunctional(unsigned index, ThreadContext *tc,
                                  Addr &capAddr, CtableMemCap &cap) const;
@@ -144,6 +202,12 @@ class CLB : public SimObject
     OpResponse startGetFunctional(unsigned index, ThreadContext *tc) const;
     OpResponse startDeleteFunctional(unsigned index, ThreadContext *tc);
     OpResponse startRevokeFunctional(unsigned index, ThreadContext *tc);
+    PreparedMinorOp buildGetOp(unsigned index, ThreadContext *tc) const;
+    PreparedMinorOp buildDeleteOp(unsigned index, ThreadContext *tc) const;
+    void commitPreparedOp(const PreparedMinorOp &op, ThreadContext *tc);
+    OpResponse consumePreparedMinorOp(unsigned index, ThreadContext *tc,
+                                      InstSeqNum seq_num,
+                                      PreparedMinorOp::Kind kind);
 
     // CLB line ownership / metadata helpers.
     bool currentPidMatches(const ClbEntry &entry, ThreadContext *tc) const;
@@ -162,8 +226,7 @@ class CLB : public SimObject
     // Persistent CLB state.
     bool _enabled;
     const bool _resetEnable;
-    const Cycles _fillLatency;
-    const Cycles _flushLatency;
+    const Cycles _accessLatency;
     const Cycles _getHitLatency;
     const Cycles _getCtableLatency;
     const Cycles _deleteHitLatency;
@@ -176,6 +239,7 @@ class CLB : public SimObject
     Addr _setupLimit;
     RegVal _setupMeta;
     std::vector<ClbEntry> entries;
+    std::map<PreparedMinorKey, PreparedMinorOp> preparedMinorOps;
 
     // Fault construction and permission checking.
     Fault createAccessFault(Addr vaddr, BaseMMU::Mode mode) const;

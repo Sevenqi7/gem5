@@ -48,13 +48,16 @@
 #ifndef __CPU_MINOR_EXEC_CONTEXT_HH__
 #define __CPU_MINOR_EXEC_CONTEXT_HH__
 
+#include "arch/riscv/mmu.hh"
+#include "arch/riscv/regs/misc.hh"
+#include "cpu/base.hh"
 #include "cpu/exec_context.hh"
 #include "cpu/minor/execute.hh"
 #include "cpu/minor/pipeline.hh"
-#include "cpu/base.hh"
 #include "cpu/simple_thread.hh"
-#include "mem/request.hh"
 #include "debug/MinorExecute.hh"
+#include "debug/MinorMem.hh"
+#include "mem/request.hh"
 
 namespace gem5
 {
@@ -71,6 +74,75 @@ class Execute;
  */
 class ExecContext : public gem5::ExecContext
 {
+  private:
+    Fault
+    preflightClbAccess(Addr addr, unsigned int size, Request::Flags flags,
+                       BaseMMU::Mode mode)
+    {
+        if (flags.isSet(Request::NO_ACCESS)) {
+            return NoFault;
+        }
+
+        auto *mmu = dynamic_cast<RiscvISA::MMU *>(thread.getMMUPtr());
+        auto *clb = mmu ? mmu->getCLB() : nullptr;
+        if (!clb) {
+            return NoFault;
+        }
+
+        if (inst->clbGatePending) {
+            if (cpu.curCycle() < inst->clbGateReadyCycle) {
+                DPRINTF(MinorMem,
+                        "CLB gate still delaying mem ref inst:%s until cycle "
+                        "%d (now %d)\n",
+                        *inst, inst->clbGateReadyCycle, cpu.curCycle());
+                return NoFault;
+            }
+
+            inst->clbGatePending = false;
+            const Fault fault = inst->clbGateFault;
+            inst->clbGateFault = NoFault;
+
+            if (fault != NoFault) {
+                DPRINTF(MinorMem,
+                        "CLB gate released mem ref inst:%s with fault %s\n",
+                        *inst, fault->name());
+                return fault;
+            }
+
+            DPRINTF(MinorMem,
+                    "CLB gate released mem ref inst:%s for LSQ issue\n",
+                    *inst);
+            return NoFault;
+        }
+
+        const auto pmode = static_cast<RiscvISA::PrivilegeMode>(
+            thread.readMiscReg(RiscvISA::MISCREG_PRV));
+        const auto result = clb->lookupAccess(addr, size, mode, pmode,
+                                              thread.getTC(), addr);
+
+        if (result.latency > Cycles(0)) {
+            inst->clbGatePending = true;
+            inst->clbGateReadyCycle = cpu.curCycle() + result.latency;
+            inst->clbGateFault = result.fault;
+
+            DPRINTF(MinorMem,
+                    "Armed CLB gate for mem ref inst:%s addr=%#x size=%u "
+                    "mode=%d latency=%d ready_cycle=%d%s\n",
+                    *inst, addr, size, mode, result.latency,
+                    inst->clbGateReadyCycle,
+                    (result.fault != NoFault ? " (fault pending)" : ""));
+            return NoFault;
+        }
+
+        if (result.fault != NoFault) {
+            DPRINTF(MinorMem,
+                    "Immediate CLB access fault for mem ref inst:%s: %s\n",
+                    *inst, result.fault->name());
+        }
+
+        return result.fault;
+    }
+
   public:
     MinorCPU &cpu;
 
@@ -113,6 +185,10 @@ class ExecContext : public gem5::ExecContext
                     const std::vector<bool>& byte_enable) override
     {
         assert(byte_enable.size() == size);
+        Fault fault = preflightClbAccess(addr, size, flags, BaseMMU::Read);
+        if (inst->clbGatePending || fault != NoFault) {
+            return fault;
+        }
         return execute.getLSQ().pushRequest(inst, true /* load */, nullptr,
             size, addr, flags, nullptr, nullptr, byte_enable);
     }
@@ -132,6 +208,10 @@ class ExecContext : public gem5::ExecContext
         override
     {
         assert(byte_enable.size() == size);
+        Fault fault = preflightClbAccess(addr, size, flags, BaseMMU::Write);
+        if (inst->clbGatePending || fault != NoFault) {
+            return fault;
+        }
         return execute.getLSQ().pushRequest(inst, false /* store */, data,
             size, addr, flags, res, nullptr, byte_enable);
     }
@@ -140,6 +220,10 @@ class ExecContext : public gem5::ExecContext
     initiateMemAMO(Addr addr, unsigned int size, Request::Flags flags,
                    AtomicOpFunctorPtr amo_op) override
     {
+        Fault fault = preflightClbAccess(addr, size, flags, BaseMMU::Write);
+        if (inst->clbGatePending || fault != NoFault) {
+            return fault;
+        }
         // AMO requests are pushed through the store path
         return execute.getLSQ().pushRequest(inst, false /* amo */, nullptr,
             size, addr, flags, nullptr, std::move(amo_op),
@@ -300,6 +384,12 @@ class ExecContext : public gem5::ExecContext
     }
 
     ThreadContext *tcBase() const override { return thread.getTC(); }
+
+    InstSeqNum
+    currentInstSeqNum() const override
+    {
+        return inst ? inst->id.execSeqNum : 0;
+    }
 
     /* @todo, should make stCondFailures persistent somewhere */
     unsigned int readStCondFailures() const override { return 0; }

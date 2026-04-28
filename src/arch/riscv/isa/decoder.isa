@@ -4895,7 +4895,6 @@ decode QUADRANT default Unknown::unknown() {
                                         "mclb.fill rejected setup or index",
                                         machInst);
                                 }
-                                xc->addTimingStall(clb->fillTimingStall());
                             }}, IsSerializeAfter, IsNonSpeculative,
                                 IprAccessOp);
                         }
@@ -4924,8 +4923,6 @@ decode QUADRANT default Unknown::unknown() {
                                     }
 
                                     clb->flushAll();
-                                    xc->addTimingStall(
-                                        clb->flushTimingStall());
                                 }}, IsSerializeAfter, IsNonSpeculative,
                                     IprAccessOp);
                             }
@@ -4947,10 +4944,7 @@ decode QUADRANT default Unknown::unknown() {
                                     "mclb.read without CLB", machInst);
                             }
 
-                            auto response = clb->readLine(rvZext(Rs1),
-                                                          xc->tcBase());
-                            Rd = response.value;
-                            xc->addTimingStall(response.stall);
+                            Rd = clb->readLine(rvZext(Rs1), xc->tcBase());
                         }}, IsSerializeAfter, IsNonSpeculative,
                             IprAccessOp);
                         0x3: decode RD {
@@ -5022,8 +5016,9 @@ decode QUADRANT default Unknown::unknown() {
                                     "uclb.get without CLB", machInst);
                             }
 
-                            auto response = clb->getCfr(rvZext(Rs1),
-                                                        xc->tcBase());
+                            auto response = clb->getCfr(
+                                rvZext(Rs1), xc->tcBase(),
+                                xc->currentInstSeqNum());
                             Rd = response.value;
                             xc->addTimingStall(response.stall);
                         }}, IsSerializeAfter, IsNonSpeculative,
@@ -5045,8 +5040,9 @@ decode QUADRANT default Unknown::unknown() {
                                     "uclb.delete without CLB", machInst);
                             }
 
-                            auto response = clb->deleteCap(rvZext(Rs1),
-                                                           xc->tcBase());
+                            auto response = clb->deleteCap(
+                                rvZext(Rs1), xc->tcBase(),
+                                xc->currentInstSeqNum());
                             Rd = response.value;
                             xc->addTimingStall(response.stall);
                         }}, IsSerializeAfter, IsNonSpeculative,
